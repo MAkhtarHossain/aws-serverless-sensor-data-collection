@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sensor Data Collection using AWS IoT. 
+  **WARNING** This template creates an Iot Gateway, IoT Rules, Kinesis Firehose Delivery Stream, an S3 Bucket, a DynamoDB Table and a Lambda Function. 
+  You will be billed for the AWS resources used if you create a stack from this template.
+  Copyright [2015-2017] Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  Licensed under the Apache License, Version 2.0 (the "License").
+  You may not use this file except in compliance with the License.
+  A copy of the License is located at http://aws.amazon.com/apache2.0/ or in the "license"
+  file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT
+  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+  for the specific language governing permissions and limitations under the License.
+  
+Parameters:
+  ProcessedDataBucketName:
+    Description: Sensor Data S3 Bucket Name
+    Default: device-sensor-data-collection
+    Type: String
+  LamdaCodeUriBucket:
+    Description: S3 Bucket where the lambda function package is stored
+    Type: String
+    Default: mah-lambda-code-package
+  CodeKeyDeIdentificationFunc:
+    Description: S3 Bucket Key
+    Type: String
+    Default: DeIdentification.zip
+  CodeKeyPublishToTopic:
+    Description: S3 Bucket Key
+    Type: String
+    Default: PublishIotData.zip
+  DeliveryStreamName:
+    Description: Kinesis Firehose Delivery Stream Name
+    Type: String
+    Default: SensorDataCollection
+  DynamoDBTableName:
+    Description: This DynamoDB Table contains Patient Reference Information
+    Type: String
+    Default: PatientReferenceTable
+  IoTTopicPath:
+    Description: The IoTTopic where the Device Simulator will publish test data
+    Type: String
+    Default: LifeSupportDevice/Sensor
+  IoTRuleName:
+    Description: IoT Rule Name that will be triggered
+    Type: String
+    Default: DeviceDataProcessingIoTRule
+  FirehoseBufferSize:
+    Description: The size of the buffer, in MBs, that Kinesis Firehose uses for incoming data before delivering it to the destination.
+    Type: Number
+    Default: '100'
+    MinValue: '1'
+    MaxValue: '128'
+    ConstraintDescription: must be between 1 and 128
+  FirehoseBufferInterval:
+    Description: The length of time, in seconds, that Kinesis Firehose buffers incoming data
+      before delivering it to the destination.
+    Type: Number
+    Default: '300'
+    MinValue: '60'
+    MaxValue: '900'
+    ConstraintDescription: must be between 60 and 900
+#----------------------------------------------------------------	
+Resources:
+
+  SensorDataS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Ref ProcessedDataBucketName
+      AccessControl: Private
+
+  SensorDataCollectionStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Ref DeliveryStreamName
+      DeliveryStreamType: 'DirectPut'
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt [FirehoseDeliveryRole, Arn]
+        BucketARN: !GetAtt [SensorDataS3Bucket, Arn]
+        Prefix: 'original/'
+        BufferingHints:
+          SizeInMBs: !Ref FirehoseBufferSize
+          IntervalInSeconds: !Ref FirehoseBufferInterval
+        CompressionFormat: 'GZIP'
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - firehose.amazonaws.com
+          Action:
+          - sts:AssumeRole
+          Condition:
+            StringEquals:
+              sts:ExternalId: !Ref 'AWS::AccountId'
+
+  IoTDeviceSimmulatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PublishToTopic
+      Handler: PublishIotData::PublishIotData.PublishIoTData::PublishToTopic
+      Runtime: dotnetcore2.0
+      CodeUri: 
+        Bucket: !Ref LamdaCodeUriBucket
+        Key: !Ref CodeKeyPublishToTopic
+      Description: IotDeviceSimmulatorFunction generates sample device data for testing
+      MemorySize: 1536
+      Timeout: 300
+      Policies:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AWSIoTFullAccess
+      Environment:
+        Variables:
+          IoTTopic: !Ref IoTTopicPath
+      Events:
+        IoTDeviceSimulatorEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{"NumberOfMsgs": "10"}'
+
+  DeIdentificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: DeIdentification
+      Handler: DeIdentification::DeIdentification.Function::FunctionHandler
+      Runtime: dotnetcore1.0
+      CodeUri: 
+        Bucket: !Ref LamdaCodeUriBucket
+        Key: !Ref CodeKeyDeIdentificationFunc
+      Description: Removes PHI/PII information from the message, inserts PHI/PII information into DynamoDB Table and puts the modified message into Kinesis Firehose Delivery Stream
+      MemorySize: 1536
+      Timeout: 300
+      Policies:
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+        - arn:aws:iam::aws:policy/AWSIoTFullAccess
+      Environment:
+        Variables:
+          TableName: !Ref PatientReferenceTable
+          DeliveryStream: !Ref DeliveryStreamName
+      Events:
+       IoT:
+         Type: IoTRule
+         Properties:
+            AwsIotSqlVersion: "2016-03-23"
+            Sql: "SELECT * FROM 'LifeSupportDevice/Sensor'"
+ 
+  PatientReferenceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: PatientID
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PatientID
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 50
+        WriteCapacityUnits: 5
